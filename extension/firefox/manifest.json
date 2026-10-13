@@ -1,0 +1,34 @@
+{
+  "manifest_version": 2,
+  "name": "DeepSeek Token Bridge (Firefox)",
+  "version": "1.5.0",
+  "description": "Auto-syncs DeepSeek userToken + device ID + headers to local bridge.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "ds-token-bridge@local.dev",
+      "strict_min_version": "109.0"
+    }
+  },
+  "permissions": [
+    "storage",
+    "tabs",
+    "https://chat.deepseek.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": true
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": ["inject.js"],
+  "browser_action": {
+    "default_title": "Open chat.deepseek.com"
+  }
+}

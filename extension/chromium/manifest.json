@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "DeepSeek Token Bridge (Chromium)",
+  "version": "1.5.0",
+  "description": "Auto-syncs DeepSeek userToken + device ID + headers to local bridge.",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": [
+    "https://chat.deepseek.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["inject.js"],
+      "matches": ["https://chat.deepseek.com/*"]
+    }
+  ],
+  "action": {
+    "default_title": "Open chat.deepseek.com"
+  }
+}
