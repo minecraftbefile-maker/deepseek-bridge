@@ -1,0 +1,9 @@
+.env
+.ds_usertoken
+.ds_device_id
+__pycache__/
+*.pyc
+sha3_wasm_bg.wasm
+venv/
+_fixer.py
+.ds_headers.json
