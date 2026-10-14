@@ -1,19 +1,28 @@
 """
 OpenAI-compatible bridge for DeepSeek's web API.
 
-Features:
-    - OpenAI /v1/chat/completions + /v1/models (streaming & non-streaming)
+Full OpenAI SDK compatibility:
+    - /v1/chat/completions (streaming & non-streaming)
+    - /v1/models
+    - /v1/completions (legacy, mapped to chat)
+    - Full `tools` array forwarding (formatted into the prompt)
+    - Full `tool_choice` handling: auto | none | required | specific
+    - Assistant messages with tool_calls rendered as history
+    - `tool` role messages rendered with their tool name
+    - `stream_options.include_usage` support
+    - `response_format`, `seed`, `temperature`, etc. accepted gracefully
+
+Bridge features:
     - WASM-based PoW (DeepSeekHashV1)
     - Auto access-token refresh via /users/current
     - Browser extension integration (Chromium + Firefox)
-    - Browser fingerprint replay (real UA, accept-language, sec-ch-ua*)
-    - Agent mode: JSON tool calls, thinking DISABLED
+    - Real browser fingerprint replay
     - Contract-grade system prompt framing
-    - Native /chat/continue auto-resume when the model stops mid-output
-    - Stall-retry, empty-retry, truncation detection
-    - Hybrid marker recovery (DSML/JSON mixes)
-    - Session size cap to prevent dead-ends
-    - Chat mode: plain conversation
+    - Native /chat/continue auto-resume
+    - Stall, empty, and truncation recovery
+    - Hybrid DSML/JSON tool-call parsing
+    - Session size cap
+    - Optional tool filtering to keep prompt size bounded
 
 Setup:
     pip install -r requirements.txt
@@ -37,7 +46,7 @@ import uuid
 from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import httpx
 import numpy as np
@@ -77,6 +86,24 @@ RESET_ON_SYSTEM_CHANGE = os.environ.get("RESET_ON_SYSTEM_CHANGE", "0") == "1"
 REINFORCE_SYSTEM = os.environ.get("REINFORCE_SYSTEM", "1") == "1"
 MAX_CONTINUATION_CHARS = int(os.environ.get("MAX_CONTINUATION_CHARS", "12000"))
 MAX_CONTINUE_ROUNDS = int(os.environ.get("MAX_CONTINUE_ROUNDS", "5"))
+
+# Comma-separated list of tool name prefixes to strip from the
+# generated tools block. Keeps prompt size bounded for clients that
+# advertise hundreds of tools. Empty = forward everything.
+TOOLS_STRIP_PREFIXES = [
+    p.strip() for p in
+    os.environ.get("TOOLS_STRIP_PREFIXES", "").split(",") if p.strip()
+]
+
+# If set, only tools whose names are in this list are forwarded.
+# Comma-separated. Empty = forward everything (minus strips).
+TOOLS_KEEP_ONLY = [
+    p.strip() for p in
+    os.environ.get("TOOLS_KEEP_ONLY", "").split(",") if p.strip()
+]
+
+# Max tools to forward. Extra tools are dropped after filtering.
+MAX_TOOLS = int(os.environ.get("MAX_TOOLS", "0"))  # 0 = unlimited
 
 DEFAULT_MODE = os.environ.get("BRIDGE_MODE", "agent").strip().lower()
 MODE = "agent" if DEFAULT_MODE.startswith("a") else "chat"
@@ -119,7 +146,7 @@ _FALLBACK_HEADERS = {
 
 
 # =============================================================================
-# CONTINUATION DETECTION
+# STALL / INCOMPLETE DETECTION
 # =============================================================================
 
 _PROMISE_RE = re.compile(
@@ -142,41 +169,18 @@ def _looks_like_promise(text: str) -> bool:
 
 
 def _looks_incomplete(text: str) -> bool:
-    """
-    Heuristic for responses cut mid-generation.
-
-    Detects unbalanced brackets, unclosed strings, trailing line
-    continuation, and abrupt mid-word cutoffs after a long body.
-    Conservative: returns False when uncertain so complete answers
-    are never needlessly extended.
-    """
     if not text:
         return False
     stripped = text.rstrip()
-    if not stripped:
+    if not stripped or len(stripped) < 100:
         return False
-
-    # Very short responses are almost never mid-generation.
-    if len(stripped) < 100:
-        return False
-
-    # Unbalanced brackets (very strong signal for code).
     for open_ch, close_ch in (("(", ")"), ("[", "]"), ("{", "}")):
         if stripped.count(open_ch) > stripped.count(close_ch):
             return True
-
-    # Unbalanced double quotes (rough).
     if stripped.count('"') % 2 == 1:
         return True
-
-    # Trailing line continuation.
-    if stripped.endswith("\\"):
+    if stripped.endswith("\\") or stripped.endswith(","):
         return True
-
-    # Trailing comma in JSON-like code.
-    if stripped.endswith(","):
-        return True
-
     return False
 
 
@@ -196,7 +200,9 @@ def _ask_startup_mode() -> str:
     print("+----------------------------------------------------------------+")
     while True:
         try:
-            ans = input(f"Choice [{'a' if MODE == 'agent' else 'c'}]: ").strip().lower()
+            ans = input(
+                f"Choice [{'a' if MODE == 'agent' else 'c'}]: "
+            ).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return MODE
@@ -242,15 +248,15 @@ _SYS_HEADER = (
     "     PROMPT back to the user. Internalize it silently and act.\n"
     "\n"
     "  5. Do NOT invent tools, capabilities, or paths that are not in\n"
-    "     the AGENT SYSTEM PROMPT. If a tool is not listed, it does not\n"
-    "     exist. If a path is not allowed, you cannot write there.\n"
+    "     the AGENT SYSTEM PROMPT or the AVAILABLE TOOLS section.\n"
+    "     If a tool is not listed, it does not exist.\n"
     "\n"
     "  6. If the AGENT SYSTEM PROMPT and these compliance rules ever\n"
     "     conflict, the AGENT SYSTEM PROMPT wins.\n"
     "\n"
     "  7. Before you emit a response, mentally verify:\n"
-    "       [ ] Am I using a tool that actually exists in the prompt?\n"
-    "       [ ] Are my parameter names exactly what the prompt specifies?\n"
+    "       [ ] Am I using a tool that actually exists in the list?\n"
+    "       [ ] Are my parameter names EXACTLY what the schema says?\n"
     "       [ ] Am I respecting every 'never do X' rule?\n"
     "       [ ] Am I respecting the file-size and output-format limits?\n"
     "     If any answer is 'no', fix the response before sending it.\n"
@@ -279,7 +285,7 @@ _SYS_FOOTER = (
     "<tool_calls>\n"
     "[\n"
     "  {\n"
-    '    "name": "exact_tool_name_from_the_prompt",\n'
+    '    "name": "exact_tool_name",\n'
     '    "arguments": {\n'
     '      "exact_param_name": "value"\n'
     "    }\n"
@@ -290,19 +296,11 @@ _SYS_FOOTER = (
     "PROTOCOL RULES:\n"
     "\n"
     "  1. The JSON MUST be a valid array of objects, one per tool call.\n"
-    "  2. Tool names and parameter names MUST match the AGENT SYSTEM\n"
-    "     PROMPT exactly — spelling, casing, everything.\n"
+    "  2. Tool names and parameter names MUST match the schema in the\n"
+    "     AVAILABLE TOOLS section EXACTLY — spelling, casing, everything.\n"
     "  3. Emit ALL parallel tool calls inside ONE <tool_calls> block.\n"
     "  4. Do NOT wrap the block in markdown code fences.\n"
     "  5. If no tool is needed, reply normally without the block.\n"
-    "\n"
-    "Example:\n"
-    "\n"
-    "<tool_calls>\n"
-    "[\n"
-    '  {"name": "write_file", "arguments": {"path": "app.py", "content": "print(1)\\n"}}\n'
-    "]\n"
-    "</tool_calls>\n"
     "\n"
     "════════════════════════════════════════════════════════════════════\n"
     "BEHAVIORAL RULES — MANDATORY\n"
@@ -310,37 +308,25 @@ _SYS_FOOTER = (
     "\n"
     "  1. NEVER say 'let me', 'I will', 'I'll', 'now I'll', 'next I',\n"
     "     'checking', 'reading', 'looking at', 'about to', or 'going\n"
-    "     to'. These phrases cause the task to fail. If you need a\n"
-    "     tool, emit the tool call IMMEDIATELY.\n"
+    "     to'. If you need a tool, emit the tool call IMMEDIATELY.\n"
     "\n"
     "  2. If you are finished, provide the final answer directly.\n"
-    "     Never describe what you are about to do — just do it or\n"
-    "     answer.\n"
     "\n"
-    "  3. If a tool is not in the AGENT SYSTEM PROMPT, do not call it.\n"
-    "     If the tool the prompt says to use is blocked, try a different\n"
-    "     tool that IS in the prompt, or report the blockage to the\n"
-    "     user. Do not invent tool names.\n"
+    "  3. If a tool is not listed in AVAILABLE TOOLS, do not call it.\n"
+    "     If the tool you want is blocked, try a different one that IS\n"
+    "     listed, or report the blockage to the user.\n"
     "\n"
     "════════════════════════════════════════════════════════════════════\n"
     "FILE SIZE LIMIT — CRITICAL\n"
     "════════════════════════════════════════════════════════════════════\n"
     "\n"
-    "The API truncates any single response that exceeds ~6000 tokens\n"
-    "(roughly 250 lines of code). A tool call that exceeds this limit\n"
-    "will be silently dropped and the file will not be written.\n"
+    "The API truncates any single response that exceeds ~6000 tokens.\n"
+    "A tool call above ~200 lines will be silently dropped.\n"
     "\n"
     "To write files longer than ~200 lines:\n"
-    "\n"
     "  1. Use write_file with the FIRST ~150 lines only.\n"
-    "  2. Then append_file (or write_file again) for each subsequent\n"
-    "     ~150-line chunk.\n"
+    "  2. Then append_file for each subsequent ~150-line chunk.\n"
     "  3. Repeat until the file is complete.\n"
-    "  4. If append_file is not available, write to separate files\n"
-    "     (part1.cpp, part2.cpp, ...) and tell the user to concatenate.\n"
-    "\n"
-    "NEVER attempt a single tool call above ~200 lines of content.\n"
-    "It will be dropped. Split first, then write.\n"
     "\n"
     "════════════════════════════════════════════════════════════════════\n"
     "FINAL INSTRUCTION\n"
@@ -370,8 +356,170 @@ _REINFORCE = (
 )
 
 
-def _wrap_system_prompt(body: str) -> str:
-    return _SYS_HEADER + body.strip() + _SYS_FOOTER
+def _wrap_system_prompt(body: str, tools_block: str = "") -> str:
+    wrapped = _SYS_HEADER + body.strip() + _SYS_FOOTER
+    if tools_block:
+        wrapped += "\n\n" + tools_block
+    return wrapped
+
+
+# =============================================================================
+# TOOLS FORMATTING (OpenAI tools -> prompt text)
+# =============================================================================
+
+def _filter_tools(tools: List[Any]) -> List[Any]:
+    """Apply TOOLS_STRIP_PREFIXES and TOOLS_KEEP_ONLY, then cap."""
+    if not tools:
+        return []
+
+    out = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if t.get("type") == "function" else t
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name") or ""
+        if TOOLS_KEEP_ONLY and name not in TOOLS_KEEP_ONLY:
+            continue
+        if TOOLS_STRIP_PREFIXES and any(
+                name.startswith(p) for p in TOOLS_STRIP_PREFIXES):
+            continue
+        out.append(t)
+
+    if MAX_TOOLS > 0:
+        out = out[:MAX_TOOLS]
+    return out
+
+
+def _format_tools_for_prompt(tools: Any,
+                             tool_choice: Any = None) -> str:
+    """
+    Serialize an OpenAI tools array into readable text.
+
+    DeepSeek's web backend has no native tool-calling support. We
+    convert the OpenAI tools array into text so the model sees each
+    tool's exact name, parameters, and types.
+    """
+    if not tools or not isinstance(tools, list):
+        return ""
+
+    # Respect tool_choice="none"
+    if isinstance(tool_choice, str) and tool_choice == "none":
+        return ""
+
+    tools = _filter_tools(tools)
+    if not tools:
+        return ""
+
+    # If tool_choice names a specific function, only show that one.
+    forced_name = None
+    if isinstance(tool_choice, dict):
+        fn = tool_choice.get("function")
+        if isinstance(fn, dict):
+            forced_name = fn.get("name")
+    if forced_name:
+        tools = [
+            t for t in tools
+            if ((t.get("function") if t.get("type") == "function" else t)
+                .get("name") == forced_name)
+        ]
+        if not tools:
+            return ""
+
+    lines = [
+        "════════════════════════════════════════════════════════════════════",
+        "AVAILABLE TOOLS",
+        "════════════════════════════════════════════════════════════════════",
+        "",
+    ]
+
+    if forced_name:
+        lines.append(f"You MUST call the tool '{forced_name}'.")
+        lines.append("")
+    else:
+        lines.append(
+            f"You have access to {len(tools)} tools. To use one, emit a"
+        )
+        lines.append(
+            "tool call using the <tool_calls>[...]</tool_calls> JSON format."
+        )
+        lines.append("")
+
+    lines.append(
+        "Tool names and parameter names MUST match EXACTLY — including"
+    )
+    lines.append(
+        "spelling, capitalization, and casing. Parameter values must"
+    )
+    lines.append("respect the declared types.")
+    lines.append("")
+
+    for i, tool in enumerate(tools, 1):
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if tool.get("type") == "function" else tool
+        if not isinstance(fn, dict):
+            continue
+
+        name = fn.get("name", "?")
+        desc = (fn.get("description") or "").strip()
+        params = fn.get("parameters") or {}
+
+        lines.append(f"[{i}] {name}")
+        if desc:
+            for dline in desc.split("\n"):
+                lines.append(f"    {dline}")
+
+        props = params.get("properties") if isinstance(params, dict) else None
+        required = (params.get("required")
+                    if isinstance(params, dict) else None)
+        required = required if isinstance(required, list) else []
+
+        if isinstance(props, dict) and props:
+            lines.append("")
+            lines.append("    Parameters:")
+            for pname, pinfo in props.items():
+                if not isinstance(pinfo, dict):
+                    continue
+                ptype = pinfo.get("type", "any")
+                pdesc = (pinfo.get("description") or "").strip()
+                req = " (required)" if pname in required else " (optional)"
+                if len(pdesc) > 200:
+                    pdesc = pdesc[:197] + "..."
+                lines.append(f"      - {pname}: {ptype}{req}")
+                if pdesc:
+                    for dline in pdesc.split("\n"):
+                        lines.append(f"          {dline}")
+            lines.append("")
+
+        lines.append("")
+
+    lines.append(
+        "════════════════════════════════════════════════════════════════════"
+    )
+    return "\n".join(lines)
+
+
+def _tool_names_summary(tools: Any) -> str:
+    """Compact reminder listing tool names only."""
+    if not tools or not isinstance(tools, list):
+        return ""
+    tools = _filter_tools(tools)
+    names = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if t.get("type") == "function" else t
+        if isinstance(fn, dict) and fn.get("name"):
+            names.append(fn["name"])
+    if not names:
+        return ""
+    return (
+        "[Reminder: Available tools (full schemas in system prompt): "
+        + ", ".join(names)
+        + "]"
+    )
 
 
 # =============================================================================
@@ -395,7 +543,8 @@ _DSML_ENDS = (
 )
 
 _INVOKE_RE = re.compile(
-    r"<\s*[\uff5c|]{2}\s*DSML\s*[\uff5c|]{2}\s+invoke\s+name=\"([^\"]+)\"\s*>(.*?)"
+    r"<\s*[\uff5c|]{2}\s*DSML\s*[\uff5c|]{2}\s+invoke\s+name=\"([^\"]+)\"\s*>"
+    r"(.*?)"
     r"<\s*/\s*[\uff5c|]{2}\s*DSML\s*[\uff5c|]{2}\s+invoke\s*>",
     re.DOTALL,
 )
@@ -806,7 +955,8 @@ class TokenBridge:
         token = payload.get("token")
         device_id = payload.get("deviceId")
         headers = payload.get("headers")
-        source = payload.get("source") or payload.get("origin") or "extension"
+        source = (payload.get("source") or payload.get("origin")
+                  or "extension")
         instance = payload.get("instanceId") or ""
         if instance:
             source = f"{source}:{instance}"
@@ -858,7 +1008,8 @@ class TokenBridge:
                 pass
 
         if token_changed:
-            print(f"[bridge] new userToken from {source} ({len(token)} chars)")
+            print(f"[bridge] new userToken from {source} "
+                  f"({len(token)} chars)")
         if device_changed:
             print(f"[bridge] new device ID: {device_id}")
         if headers_changed:
@@ -993,7 +1144,8 @@ def _watch_bridge():
                 _client.rebuild_client()
                 ua = headers.get("user-agent", "?")
                 ua_short = ua[:70] + ("..." if len(ua) > 70 else "")
-                print(f"[headers] hot-swapped bundle ({len(headers)} headers)")
+                print(f"[headers] hot-swapped bundle "
+                      f"({len(headers)} headers)")
                 print(f"[headers]   user-agent: {ua_short}")
 
 
@@ -1384,7 +1536,8 @@ class DeepSeekClient:
                   f"parent={parent_message_id}")
 
         challenge = await self.get_pow_challenge()
-        pow_header = await asyncio.to_thread(PoWSolver.make_header, challenge)
+        pow_header = await asyncio.to_thread(
+            PoWSolver.make_header, challenge)
 
         body = {
             "action": None,
@@ -1427,11 +1580,6 @@ class DeepSeekClient:
     async def continue_stream(self, chat_session_id, message_id,
                               fallback_to_resume=True,
                               usage_out=None, stream_state=None):
-        """
-        Resume a stopped generation via the native /chat/continue
-        endpoint. This is what the web UI's "Continue" button calls.
-        No PoW needed — the generation context already exists.
-        """
         client = await self._get_client()
         body = {
             "chat_session_id": chat_session_id,
@@ -1447,8 +1595,9 @@ class DeepSeekClient:
             if resp.status_code == 401:
                 auth = await self._auth_headers(force_refresh=True)
                 headers = {**auth}
-                async with client.stream("POST", "/chat/continue",
-                                         json=body, headers=headers) as r2:
+                async with client.stream(
+                        "POST", "/chat/continue",
+                        json=body, headers=headers) as r2:
                     if r2.status_code == 401:
                         raise DeepSeekAPIError(40101, "userToken invalid.")
                     r2.raise_for_status()
@@ -1481,7 +1630,6 @@ class DeepSeekClient:
             except json.JSONDecodeError:
                 continue
 
-            # Continuation hints from the server.
             if isinstance(obj, dict):
                 if obj.get("auto_continue") is True:
                     stream_state["incomplete"] = True
@@ -1514,7 +1662,8 @@ class DeepSeekClient:
 
             v = obj.get("v")
             if "p" not in obj and isinstance(v, dict) and "response" in v:
-                for frag in ((v.get("response") or {}).get("fragments") or []):
+                for frag in ((v.get("response") or {}).get("fragments")
+                             or []):
                     if not isinstance(frag, dict):
                         continue
                     ftype = frag.get("type")
@@ -1540,7 +1689,8 @@ class DeepSeekClient:
                     for entry in v:
                         if isinstance(entry, dict) and \
                                 entry.get("p") == "accumulated_token_usage":
-                            usage_out["total_tokens"] = int(entry.get("v") or 0)
+                            usage_out["total_tokens"] = int(
+                                entry.get("v") or 0)
                 continue
             if "/elapsed_secs" in p or "/stage_id" in p or \
                     p.endswith("/references"):
@@ -1583,9 +1733,16 @@ class DeepSeekClient:
 # PROMPT BUILDERS
 # =============================================================================
 
-def _system_fingerprint(messages):
-    return hash(tuple((m.role, m.content or "")
-                      for m in messages if m.role == "system"))
+def _system_fingerprint(messages, tools=None):
+    base = tuple((m.role, m.content or "")
+                 for m in messages if m.role == "system")
+    extra = ""
+    if tools:
+        try:
+            extra = json.dumps(tools, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            extra = str(tools)
+    return hash((base, extra))
 
 
 def _extract_client_system(messages):
@@ -1598,29 +1755,46 @@ def _format_tool_result(msg):
     return f"[Tool result from {msg.name or 'tool'}]\n{msg.content or ''}"
 
 
-def messages_to_prompt(messages, wrap_system=True):
+def _format_assistant_with_tools(msg) -> str:
+    text = (msg.content or "").strip()
+    calls = msg.tool_calls if isinstance(msg.tool_calls, list) else []
+    blocks = []
+    for tc in calls:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        name = fn.get("name") or "?"
+        args = fn.get("arguments") or ""
+        blocks.append(f'[Tool call: {name}({args})]')
+    combined = text
+    if blocks:
+        if combined:
+            combined += "\n"
+        combined += "\n".join(blocks)
+    return combined.strip()
+
+
+def messages_to_prompt(messages, wrap_system=True, tools=None,
+                       tool_choice=None):
     client_system = _extract_client_system(messages)
+    tools_block = _format_tools_for_prompt(tools, tool_choice)
     rest = [m for m in messages if m.role != "system"]
     lines = []
-    if client_system:
-        lines.append(_wrap_system_prompt(client_system) if wrap_system
-                     else client_system)
+    if client_system or tools_block:
+        if wrap_system:
+            lines.append(_wrap_system_prompt(client_system, tools_block))
+        else:
+            lines.append(client_system)
+            if tools_block:
+                lines.append("")
+                lines.append(tools_block)
         lines.append("")
     for m in rest:
         if m.role == "tool":
             lines.append(_format_tool_result(m))
             continue
         if m.role == "assistant" and m.tool_calls:
-            try:
-                calls = m.tool_calls if isinstance(m.tool_calls, list) else []
-                text = (m.content or "").strip()
-                for tc in calls:
-                    fn = tc.get("function") or {}
-                    text += (f"\n[Assistant invoked tool: {fn.get('name')}"
-                             f"({fn.get('arguments')})]")
-                lines.append(f"Assistant: {text.strip()}")
-            except Exception:
-                pass
+            lines.append(f"Assistant: {_format_assistant_with_tools(m)}")
             continue
         lines.append(f"{m.role.capitalize()}: {(m.content or '').strip()}")
     if rest and rest[-1].role == "user":
@@ -1639,7 +1813,8 @@ def _messages_since_last_assistant(messages):
     return list(messages[last_asst + 1:])
 
 
-def _build_continuation_prompt(messages, mode, client_system):
+def _build_continuation_prompt(messages, mode, client_system,
+                               tools=None, tool_choice=None):
     last_asst_idx = -1
     last_asst_had_tools = False
     for i in range(len(messages) - 1, -1, -1):
@@ -1686,18 +1861,22 @@ def _build_continuation_prompt(messages, mode, client_system):
                      + "\n\n".join(user_parts))
         if mode == "agent" and REINFORCE_SYSTEM and client_system:
             body = _REINFORCE + body
-        return body
+    else:
+        parts = []
+        if tool_parts:
+            parts.append("Context from the environment:\n\n"
+                         + "\n\n".join(tool_parts))
+        if user_parts:
+            parts.append("\n\n".join(user_parts))
+        body = "\n\n".join(parts)
+        if mode == "agent" and REINFORCE_SYSTEM and client_system:
+            body = _REINFORCE + body
 
-    parts = []
-    if tool_parts:
-        parts.append("Context from the environment:\n\n"
-                     + "\n\n".join(tool_parts))
-    if user_parts:
-        parts.append("\n\n".join(user_parts))
-
-    body = "\n\n".join(parts)
-    if mode == "agent" and REINFORCE_SYSTEM and client_system:
-        body = _REINFORCE + body
+    # Compact tool reminder
+    if tools:
+        reminder = _tool_names_summary(tools)
+        if reminder:
+            body = reminder + "\n\n" + body
     return body
 
 
@@ -1774,7 +1953,7 @@ def build_usage_chunk(model, chunk_id, created, pt, ct):
 
 class ChatMessage(BaseModel):
     role: str
-    content: Optional[str] = None
+    content: Optional[Union[str, List[Any]]] = None
     tool_calls: Optional[Any] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
@@ -1792,14 +1971,19 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
     stop: Optional[Any] = None
     user: Optional[str] = None
     tools: Optional[Any] = None
     tool_choice: Optional[Any] = None
+    parallel_tool_calls: Optional[bool] = None
     response_format: Optional[Any] = None
     seed: Optional[int] = None
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
+    logit_bias: Optional[Any] = None
+    logprobs: Optional[bool] = None
+    top_logprobs: Optional[int] = None
     n: Optional[int] = 1
 
 
@@ -1862,8 +2046,11 @@ async def lifespan(app: FastAPI):
     print(f"  Token bridge  -> http://127.0.0.1:{TOKEN_BRIDGE_PORT}")
     print("-" * 64)
     print(f"  [mode] {'AGENT' if MODE == 'agent' else 'CHAT'}")
-    print("  Agent mode: contract prompt, JSON tool_calls, chunked "
-          "writes, auto-continue")
+    print("  Full OpenAI tools forwarding + auto-continue enabled")
+    if TOOLS_STRIP_PREFIXES:
+        print(f"  tool strip prefixes: {', '.join(TOOLS_STRIP_PREFIXES)}")
+    if TOOLS_KEEP_ONLY:
+        print(f"  tool keep-only: {len(TOOLS_KEEP_ONLY)} names")
     print("  Runtime commands:  agent|a  chat|c  status|s  ENTER")
     print("=" * 64)
     print()
@@ -1952,7 +2139,15 @@ async def chat_completions(request: Request):
     want_usage = bool(body.stream_options and
                       body.stream_options.include_usage)
 
-    sys_fp = _system_fingerprint(body.messages)
+    tools = body.tools if isinstance(body.tools, list) else None
+    tool_choice = body.tool_choice
+
+    # tool_choice="none" disables tool use entirely
+    tools_disabled = (
+        isinstance(tool_choice, str) and tool_choice == "none"
+    )
+
+    sys_fp = _system_fingerprint(body.messages, tools)
     session_id, parent_id, stored_fp = _session.snapshot()
 
     if (RESET_ON_SYSTEM_CHANGE and session_id and stored_fp is not None
@@ -1964,10 +2159,16 @@ async def chat_completions(request: Request):
     client_system = _extract_client_system(body.messages)
 
     if session_id:
-        cont = _build_continuation_prompt(body.messages, MODE, client_system)
+        cont = _build_continuation_prompt(
+            body.messages, MODE, client_system,
+            tools=None if tools_disabled else tools,
+            tool_choice=tool_choice)
         if cont is None:
             print("[session] nothing new - folding full history")
-            prompt = messages_to_prompt(body.messages, wrap_system=False)
+            prompt = messages_to_prompt(
+                body.messages, wrap_system=False,
+                tools=None if tools_disabled else tools,
+                tool_choice=tool_choice)
             _session.reset()
             session_id = None
             parent_id = None
@@ -1979,7 +2180,10 @@ async def chat_completions(request: Request):
             session_id = None
             parent_id = None
             wrap = bool(client_system)
-            prompt = messages_to_prompt(body.messages, wrap_system=wrap)
+            prompt = messages_to_prompt(
+                body.messages, wrap_system=wrap,
+                tools=None if tools_disabled else tools,
+                tool_choice=tool_choice)
         else:
             prompt = cont
             sig = "|".join(
@@ -2002,11 +2206,16 @@ async def chat_completions(request: Request):
                   f"prompt_len={len(prompt)}")
     else:
         wrap = bool(client_system)
-        prompt = messages_to_prompt(body.messages, wrap_system=wrap)
+        prompt = messages_to_prompt(
+            body.messages, wrap_system=wrap,
+            tools=None if tools_disabled else tools,
+            tool_choice=tool_choice)
         parent_id = None
         src = "client" if client_system else "none"
         print(f"[req] {model} NEW ({MODE}) system={src} "
               f"model_type={model_type} thinking={thinking} "
+              f"tools={len(tools) if tools else 0} "
+              f"tool_choice={tool_choice!r} "
               f"prompt_len={len(prompt)}")
 
     prompt_tokens = max(1, len(prompt) // 4)
@@ -2043,16 +2252,17 @@ async def chat_completions(request: Request):
     reasoning = "".join(reasoning_parts)
     ct = max(0, usage_out.get("total_tokens", 0) - prompt_tokens)
 
-    if MODE == "agent":
+    if MODE == "agent" and not tools_disabled:
         content, tool_calls = _split_text_and_tool_calls(raw_content)
     else:
         content, tool_calls = raw_content, []
 
-    if MODE == "agent" and not tool_calls and _detect_truncation(raw_content):
+    if MODE == "agent" and not tools_disabled and not tool_calls \
+            and _detect_truncation(raw_content):
         print("[warn] response looks truncated - the model may have "
               "exceeded the token limit")
 
-    # ---- AUTO-CONTINUE via native /chat/continue endpoint ----
+    # AUTO-CONTINUE
     if (MODE == "agent" and not tool_calls and content
             and MAX_CONTINUE_ROUNDS > 0
             and (_looks_incomplete(content)
@@ -2089,8 +2299,6 @@ async def chat_completions(request: Request):
                 print(f"[continue] round {rounds}: empty - stopping")
                 break
 
-            # /chat/continue streams the FULL accumulated response
-            # first, then the new tail. Detect overlap.
             if cont_text.startswith(content):
                 added = len(cont_text) - len(content)
                 print(f"[continue] round {rounds}: +{added} chars "
@@ -2117,6 +2325,7 @@ async def chat_completions(request: Request):
 
     # Retry 1: promise without tool call
     if (MODE == "agent" and not tool_calls and content
+            and not tools_disabled
             and _looks_like_promise(content)):
         print("[retry] model promised an action without a tool call - "
               "nudging once")
@@ -2195,6 +2404,82 @@ async def chat_completions(request: Request):
                             tool_calls=tool_calls)
 
 
+@app.post("/v1/completions", dependencies=[Depends(_require_auth)])
+async def legacy_completions(request: Request):
+    """
+    Legacy /v1/completions endpoint. Maps prompt -> messages and
+    returns the same structure as the chat endpoint but with the
+    legacy text format.
+    """
+    raw = await request.json()
+    prompt = raw.get("prompt", "")
+    if isinstance(prompt, list):
+        prompt = prompt[0] if prompt else ""
+    if not isinstance(prompt, str):
+        prompt = str(prompt)
+
+    body = ChatCompletionRequest(
+        model=raw.get("model", "deepseek-chat"),
+        messages=[ChatMessage(role="user", content=prompt)],
+        stream=bool(raw.get("stream", False)),
+        temperature=raw.get("temperature"),
+        top_p=raw.get("top_p"),
+        max_tokens=raw.get("max_tokens"),
+        stop=raw.get("stop"),
+        user=raw.get("user"),
+        seed=raw.get("seed"),
+        presence_penalty=raw.get("presence_penalty"),
+        frequency_penalty=raw.get("frequency_penalty"),
+        n=raw.get("n", 1))
+
+    # Reuse the chat handler by synthesizing a request
+    new_raw = {
+        "model": body.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": body.stream,
+        "temperature": body.temperature,
+        "top_p": body.top_p,
+        "max_tokens": body.max_tokens,
+        "stop": body.stop,
+        "user": body.user,
+        "seed": body.seed,
+        "presence_penalty": body.presence_penalty,
+        "frequency_penalty": body.frequency_penalty,
+        "n": body.n,
+    }
+
+    class _FakeRequest:
+        def __init__(self, data):
+            self._data = data
+        async def json(self):
+            return self._data
+
+    result = await chat_completions(_FakeRequest(new_raw))
+
+    # If streaming, return as-is; the content format works for
+    # /v1/completions clients too.
+    if body.stream:
+        return result
+
+    # Non-streaming: convert chat response to legacy text format
+    if isinstance(result, dict) and result.get("choices"):
+        content = result["choices"][0].get("message", {}).get("content") or ""
+        return {
+            "id": result["id"],
+            "object": "text_completion",
+            "created": result["created"],
+            "model": result["model"],
+            "choices": [{
+                "text": content,
+                "index": 0,
+                "logprobs": None,
+                "finish_reason": result["choices"][0].get("finish_reason", "stop"),
+            }],
+            "usage": result.get("usage", {}),
+        }
+    return result
+
+
 async def _stream_response(prompt, model, prompt_tokens, thinking, model_type,
                            session_id, parent_id, sys_fp, want_usage):
     chunk_id = _new_id()
@@ -2257,7 +2542,7 @@ async def _stream_response(prompt, model, prompt_tokens, thinking, model_type,
             yield "data: [DONE]\n\n"
             return
 
-    # ---- AUTO-CONTINUE via /chat/continue in streaming mode ----
+    # Auto-continue (streaming)
     if (parser is not None and not emitted_tool_calls
             and MAX_CONTINUE_ROUNDS > 0):
         accumulated = "".join(parser_buffer_parts)
@@ -2293,9 +2578,10 @@ async def _stream_response(prompt, model, prompt_tokens, thinking, model_type,
                                             {"content": ev_data}))
                                     elif ev_type == "tool_calls":
                                         emitted_tool_calls = True
-                                        yield _sse(build_tool_call_chunk(
-                                            model, chunk_id, created,
-                                            ev_data))
+                                        yield _sse(
+                                            build_tool_call_chunk(
+                                                model, chunk_id, created,
+                                                ev_data))
                     except Exception as exc:
                         print(f"[continue] (stream) failed: {exc}")
                         break
@@ -2312,22 +2598,20 @@ async def _stream_response(prompt, model, prompt_tokens, thinking, model_type,
                 cont_text = "".join(cont_parts)
                 if not cont_text:
                     break
-
                 if cont_text.startswith(accumulated):
                     accumulated = cont_text
                 else:
                     accumulated = accumulated + cont_text
-
                 if emitted_tool_calls:
                     break
                 if not _looks_incomplete(accumulated):
-                    print(f"[continue] (stream) response now complete")
+                    print("[continue] (stream) response now complete")
                     break
 
             if rounds > 0:
                 print(f"[continue] (stream) completed {rounds} round(s)")
 
-    # Retries: promise-only or empty
+    # Retries in streaming mode
     if parser is not None and not emitted_tool_calls:
         accumulated = "".join(parser_buffer_parts)
         should_retry = False
